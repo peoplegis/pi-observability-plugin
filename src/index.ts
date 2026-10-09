@@ -31,6 +31,19 @@ const COMPACTION_OBSERVATION_NAME = "Compaction";
 const BRANCH_SUMMARY_OBSERVATION_NAME = "Branch Summary";
 const TOOL_USAGE_OBSERVATION_NAME = "Tool LLM Usage";
 const BASE_TAGS = ["pi"];
+const GENERIC_JIRA_KEY = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/;
+
+export function extractJiraKey(text: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!text) return undefined;
+  const projects = (env.LANGFUSE_JIRA_PROJECTS ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => /^[A-Za-z][A-Za-z0-9]*$/.test(p));
+  const pattern = projects.length
+    ? new RegExp(`\\b(?:${projects.join("|")})-\\d+\\b`, "i")
+    : GENERIC_JIRA_KEY;
+  return text.match(pattern)?.[0].toUpperCase();
+}
 
 // A data: URI is only worth emitting if the processor swaps it for a media
 // reference; with uploads off it stays in the span as full base64.
@@ -689,6 +702,8 @@ export default function (pi: ExtensionAPI) {
   let state: PromptState | undefined;
   let traceAttributes: TraceAttributes = {};
   let gitBranch: string | undefined;
+  let jiraKey: string | undefined = extractJiraKey(process.env.LANGFUSE_JIRA_ID);
+  const traceTags = () => (jiraKey ? [...BASE_TAGS, jiraKey] : BASE_TAGS);
   let sessionHadImages = false;
   let fallbackTurnCounter = 0;
   let lastPromptText = "";
@@ -829,6 +844,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const result = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 1000 });
       gitBranch = result.code === 0 ? result.stdout.trim() : undefined;
+      jiraKey ??= extractJiraKey(gitBranch);
     } catch {
       gitBranch = undefined;
     }
@@ -846,6 +862,7 @@ export default function (pi: ExtensionAPI) {
     const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     lastContextHistory = undefined;
+    jiraKey ??= extractJiraKey(gitBranch) ?? extractJiraKey(event.prompt);
     const isSubagent = inheritedParent?.source === "subagent";
     traceAttributes = externalTrace
       ? {}
@@ -854,7 +871,7 @@ export default function (pi: ExtensionAPI) {
           [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: isSubagent
             ? (inheritedParent!.sessionId ?? sessionId)
             : sessionId,
-          [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+          [LangfuseOtelSpanAttributes.TRACE_TAGS]: traceTags(),
           ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
         };
 
@@ -870,6 +887,7 @@ export default function (pi: ExtensionAPI) {
           turn_number: turnNumber,
           cwd: ctx.cwd,
           ...(gitBranch ? { git_branch: gitBranch } : {}),
+          ...(jiraKey ? { jira_id: jiraKey } : {}),
           ...(ctx.model ? { model: ctx.model.id, provider: ctx.model.provider } : {}),
           ...(isSubagent
             ? { pi_subagent: true, subagent_depth: inheritedParent!.depth, parent_session_id: inheritedParent!.sessionId }
@@ -1135,7 +1153,7 @@ export default function (pi: ExtensionAPI) {
       : {
           ...(inheritedParent ? {} : { [LangfuseOtelSpanAttributes.TRACE_NAME]: `Pi ${name}` }),
           [LangfuseOtelSpanAttributes.TRACE_SESSION_ID]: inheritedParent?.sessionId ?? sessionId,
-          [LangfuseOtelSpanAttributes.TRACE_TAGS]: BASE_TAGS,
+          [LangfuseOtelSpanAttributes.TRACE_TAGS]: traceTags(),
           ...(config.userId ? { [LangfuseOtelSpanAttributes.TRACE_USER_ID]: config.userId } : {}),
         };
     const obs = startObservation(
@@ -1148,6 +1166,7 @@ export default function (pi: ExtensionAPI) {
           extension: EXTENSION_NAME,
           extension_version: EXTENSION_VERSION,
           session_id: sessionId,
+          ...(jiraKey ? { jira_id: jiraKey } : {}),
         },
       },
       {

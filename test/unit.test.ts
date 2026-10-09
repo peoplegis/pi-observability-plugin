@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  extractJiraKey,
   extractText,
   readInheritedParent,
   parseTraceparent,
@@ -797,5 +798,20 @@ describe("extractThinking", () => {
   it("keeps a long reasoning block whole", () => {
     const parts = extractThinking([{ type: "thinking", thinking: "z".repeat(120_000) }]);
     assert.equal(parts[0]!.content.length, 120_000);
+  });
+});
+
+describe("extractJiraKey", () => {
+  it("finds a key in a branch name", () => {
+    assert.equal(extractJiraKey("feature/SDEV-1853-add-proc", {}), "SDEV-1853");
+  });
+  it("returns undefined when there is no key", () => {
+    assert.equal(extractJiraKey("main", {}), undefined);
+    assert.equal(extractJiraKey(undefined, {}), undefined);
+  });
+  it("restricts to configured projects and normalizes case", () => {
+    const env = { LANGFUSE_JIRA_PROJECTS: "sdev, ops" };
+    assert.equal(extractJiraKey("fix UTF-8 then sdev-12", env), "SDEV-12");
+    assert.equal(extractJiraKey("UTF-8 only", env), undefined);
   });
 });
