@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   extractJiraKey,
+  extractJiraKeyFromPrompt,
   extractText,
   readInheritedParent,
   parseTraceparent,
@@ -813,5 +814,17 @@ describe("extractJiraKey", () => {
     const env = { LANGFUSE_JIRA_PROJECTS: "sdev, ops" };
     assert.equal(extractJiraKey("fix UTF-8 then sdev-12", env), "SDEV-12");
     assert.equal(extractJiraKey("UTF-8 only", env), undefined);
+  });
+});
+
+describe("extractJiraKeyFromPrompt", () => {
+  it("picks up a key announced as the current work", () => {
+    assert.equal(extractJiraKeyFromPrompt("I'm working on SDEV-2182 today", {}), "SDEV-2182");
+    assert.equal(extractJiraKeyFromPrompt("let's switch to jira ticket sdev-9", {}), "SDEV-9");
+    assert.equal(extractJiraKeyFromPrompt("work on JIRA SDEV-5", {}), "SDEV-5");
+  });
+  it("ignores keys merely mentioned in passing", () => {
+    assert.equal(extractJiraKeyFromPrompt("see SDEV-2182 for context", {}), undefined);
+    assert.equal(extractJiraKeyFromPrompt("the ticket is about UTF-8 and also SDEV-4", { LANGFUSE_JIRA_PROJECTS: "SDEV" }), undefined);
   });
 });

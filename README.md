@@ -88,7 +88,7 @@ a single value without editing the file.
 | `LANGFUSE_TRACING_ENVIRONMENT` | Environment label for the traces (e.g. `production`)                                                                                              | No                  |
 | `LANGFUSE_USER_ID`             | User ID attached to all traces                                                                                                                    | No                  |
 | `LANGFUSE_JIRA_ID`             | Explicit JIRA issue key to tag every trace with (e.g. `SDEV-1853`). Overrides auto-detection                                                   | No                  |
-| `LANGFUSE_JIRA_PROJECTS`       | Comma-separated JIRA project keys to match (e.g. `SDEV,OPS`). Unset, any `ABC-123`-shaped key matches. Detection order: `LANGFUSE_JIRA_ID`, git branch, first prompt | No                  |
+| `LANGFUSE_JIRA_PROJECTS`       | Comma-separated JIRA project keys to match (e.g. `SDEV,OPS`). Unset, any `ABC-123`-shaped key matches. Initial key: `LANGFUSE_JIRA_ID`, else git branch. A prompt like "working on SDEV-123" or the `/jira SDEV-123` command switches it (`/jira clear` removes it); the choice is saved in the session | No                  |
 | `OTEL_SERVICE_NAME`            | OpenTelemetry service name for the exported spans. Unset, OpenTelemetry's own default applies                                                     | No                  |
 | `OTEL_RESOURCE_ATTRIBUTES`     | Extra OpenTelemetry resource attributes as a comma-separated `key=value` list (e.g. `service.namespace=engineering,team.name=platform`). Langfuse shows them under `resourceAttributes` in the trace and observation metadata | No                  |
 

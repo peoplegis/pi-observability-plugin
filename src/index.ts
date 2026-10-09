@@ -33,16 +33,29 @@ const TOOL_USAGE_OBSERVATION_NAME = "Tool LLM Usage";
 const BASE_TAGS = ["pi"];
 const GENERIC_JIRA_KEY = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/;
 
-export function extractJiraKey(text: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  if (!text) return undefined;
+const JIRA_ENTRY_TYPE = "langfuse-jira";
+const JIRA_INTENT = String.raw`\b(?:working\s+on|work\s+on|switch(?:ing)?\s+to|ticket|issue|jira|story)\b(?:[^\w-]+(?!\w+-\d)\w+){0,2}[^\w-]+`;
+
+function jiraKeySource(env: NodeJS.ProcessEnv): string {
   const projects = (env.LANGFUSE_JIRA_PROJECTS ?? "")
     .split(",")
     .map((p) => p.trim())
     .filter((p) => /^[A-Za-z][A-Za-z0-9]*$/.test(p));
-  const pattern = projects.length
-    ? new RegExp(`\\b(?:${projects.join("|")})-\\d+\\b`, "i")
-    : GENERIC_JIRA_KEY;
-  return text.match(pattern)?.[0].toUpperCase();
+  return projects.length ? `\\b(?:${projects.join("|")})-\\d+\\b` : GENERIC_JIRA_KEY.source;
+}
+
+export function extractJiraKey(text: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!text) return undefined;
+  return text.match(new RegExp(jiraKeySource(env), "i"))?.[0].toUpperCase();
+}
+
+export function extractJiraKeyFromPrompt(
+  prompt: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (!prompt) return undefined;
+  const match = prompt.match(new RegExp(`${JIRA_INTENT}(${jiraKeySource(env)})`, "i"));
+  return match?.[1]?.toUpperCase();
 }
 
 // A data: URI is only worth emitting if the processor swaps it for a media
@@ -703,6 +716,11 @@ export default function (pi: ExtensionAPI) {
   let traceAttributes: TraceAttributes = {};
   let gitBranch: string | undefined;
   let jiraKey: string | undefined = extractJiraKey(process.env.LANGFUSE_JIRA_ID);
+  const setJiraKey = (key: string | undefined) => {
+    if (key === jiraKey) return;
+    jiraKey = key;
+    pi.appendEntry(JIRA_ENTRY_TYPE, { key: key ?? null });
+  };
   const traceTags = () => (jiraKey ? [...BASE_TAGS, jiraKey] : BASE_TAGS);
   let sessionHadImages = false;
   let fallbackTurnCounter = 0;
@@ -844,10 +862,38 @@ export default function (pi: ExtensionAPI) {
     try {
       const result = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { timeout: 1000 });
       gitBranch = result.code === 0 ? result.stdout.trim() : undefined;
-      jiraKey ??= extractJiraKey(gitBranch);
     } catch {
       gitBranch = undefined;
     }
+    let restored: { key: string | null } | undefined;
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === "custom" && entry.customType === JIRA_ENTRY_TYPE) {
+        restored = entry.data as { key: string | null };
+      }
+    }
+    if (restored) jiraKey = restored.key ?? undefined;
+    else jiraKey ??= extractJiraKey(gitBranch);
+  });
+
+  pi.registerCommand("jira", {
+    description: "Tag Langfuse traces with a JIRA issue key: /jira SDEV-123, /jira clear, or /jira to show",
+    handler: async (args, ctx) => {
+      const arg = args.trim();
+      if (!arg) {
+        ctx.ui.notify(jiraKey ? `Langfuse JIRA tag: ${jiraKey}` : "No Langfuse JIRA tag set", "info");
+      } else if (arg.toLowerCase() === "clear") {
+        setJiraKey(undefined);
+        ctx.ui.notify("Langfuse JIRA tag cleared", "info");
+      } else {
+        const key = extractJiraKey(arg);
+        if (!key) {
+          ctx.ui.notify(`Not a JIRA key: ${arg}`, "error");
+          return;
+        }
+        setJiraKey(key);
+        ctx.ui.notify(`Langfuse traces now tagged ${key}`, "info");
+      }
+    },
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -862,7 +908,8 @@ export default function (pi: ExtensionAPI) {
     const userText = [event.prompt, ...promptImages.map(describeImage)].filter(Boolean).join("\n");
     lastPromptText = userText;
     lastContextHistory = undefined;
-    jiraKey ??= extractJiraKey(gitBranch) ?? extractJiraKey(event.prompt);
+    const promptKey = extractJiraKeyFromPrompt(event.prompt);
+    if (promptKey) setJiraKey(promptKey);
     const isSubagent = inheritedParent?.source === "subagent";
     traceAttributes = externalTrace
       ? {}
