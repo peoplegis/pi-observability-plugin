@@ -1,11 +1,14 @@
 
 import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { join } from "node:path";
 import {
   type ExtensionAPI,
   type ExtensionContext,
   convertToLlm,
   getAgentDir,
+  SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import {
@@ -34,6 +37,12 @@ const BASE_TAGS = ["pi"];
 const GENERIC_JIRA_KEY = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/;
 
 const JIRA_ENTRY_TYPE = "langfuse-jira";
+const JIRA_CONTEXT_TYPE = "jira-context";
+const JIRA_FIELDS = "summary,status,issuetype,assignee,description,comment";
+const JIRA_MAX_SECTION_CHARS = 6000;
+const JIRA_MAX_COMMENTS = 10;
+const JIRA_MAX_RELATED_SESSIONS = 5;
+const JIRA_MAX_SESSIONS_SCANNED = 200;
 const JIRA_INTENT = String.raw`\b(?:working\s+on|work\s+on|switch(?:ing)?\s+to|ticket|issue|jira|story)\b(?:[^\w-]+(?!\w+-\d)\w+){0,2}[^\w-]+`;
 
 function jiraKeySource(env: NodeJS.ProcessEnv): string {
@@ -42,6 +51,122 @@ function jiraKeySource(env: NodeJS.ProcessEnv): string {
     .map((p) => p.trim())
     .filter((p) => /^[A-Za-z][A-Za-z0-9]*$/.test(p));
   return projects.length ? `\\b(?:${projects.join("|")})-\\d+\\b` : GENERIC_JIRA_KEY.source;
+}
+
+export type JiraLookup =
+  | { status: "found"; title: string; context: string }
+  | { status: "not_found" }
+  | { status: "unavailable"; reason: string };
+
+/** Verify a JIRA issue exists via the acli CLI and return its summary. */
+export function lookupJiraIssue(key: string, acli = process.env.LANGFUSE_ACLI_PATH || "acli"): Promise<JiraLookup> {
+  return new Promise((resolve) => {
+    execFile(
+      acli,
+      ["jira", "workitem", "view", key, "--fields", JIRA_FIELDS, "--json"],
+      { timeout: 15_000, maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (!error) {
+          try {
+            const issue = JSON.parse(stdout);
+            const title = issue?.fields?.summary;
+            if (typeof title === "string") {
+              return resolve({ status: "found", title, context: formatJiraContext(key, issue) });
+            }
+          } catch {}
+          return resolve({ status: "unavailable", reason: "unexpected acli output" });
+        }
+        const output = `${stderr ?? ""}${stdout ?? ""}`;
+        if (/does not exist|not found|404/i.test(output)) return resolve({ status: "not_found" });
+        resolve({ status: "unavailable", reason: output.trim().split("\n")[0] || error.message });
+      },
+    );
+  });
+}
+
+/** Flatten an Atlassian Document Format node (or plain string) to text. */
+export function adfToText(node: unknown): string {
+  if (node == null) return "";
+  if (typeof node === "string") return node;
+  if (typeof node !== "object") return "";
+  const n = node as { type?: string; text?: string; content?: unknown[]; attrs?: { text?: string; url?: string } };
+  if (n.type === "text") return n.text ?? "";
+  if (n.type === "hardBreak") return "\n";
+  if (n.type === "mention" || n.type === "emoji" || n.type === "inlineCard") {
+    return n.attrs?.text ?? n.attrs?.url ?? "";
+  }
+  const children = Array.isArray(n.content) ? n.content : [];
+  const inner = children.map(adfToText);
+  switch (n.type) {
+    case "listItem":
+      return `- ${inner.join("").trim()}\n`;
+    case "paragraph":
+    case "heading":
+    case "codeBlock":
+    case "blockquote":
+    case "tableRow":
+      return `${inner.join(n.type === "tableRow" ? " | " : "")}\n`;
+    default:
+      return inner.join("");
+  }
+}
+
+const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}\n[truncated]` : text);
+
+/** Render an acli work-item JSON payload as markdown suitable for LLM context. */
+export function formatJiraContext(key: string, issue: any): string {
+  const f = issue?.fields ?? {};
+  const lines = [`# JIRA ${key}: ${f.summary ?? ""}`];
+  const meta = [
+    f.issuetype?.name && `Type: ${f.issuetype.name}`,
+    f.status?.name && `Status: ${f.status.name}`,
+    f.assignee?.displayName && `Assignee: ${f.assignee.displayName}`,
+  ].filter(Boolean);
+  if (meta.length) lines.push(meta.join(" | "));
+  const description = adfToText(f.description).trim();
+  if (description) lines.push("", "## Description", clip(description, JIRA_MAX_SECTION_CHARS));
+  const comments: any[] = Array.isArray(f.comment?.comments) ? f.comment.comments : [];
+  if (comments.length) {
+    lines.push("", "## Comments");
+    for (const c of comments.slice(-JIRA_MAX_COMMENTS)) {
+      const body = adfToText(c.body).trim();
+      if (body) lines.push(`### ${c.author?.displayName ?? "unknown"} (${c.created ?? ""})`, clip(body, 2000));
+    }
+  }
+  return lines.join("\n");
+}
+
+export type RelatedSession = { path: string; label: string };
+
+/** Find prior sessions (excluding the current one) whose log mentions the JIRA key, newest first. */
+export async function findRelatedSessions(
+  key: string,
+  currentSessionFile: string | undefined,
+  listSessions: () => Promise<Array<{ path: string; modified: Date; messageCount: number; name?: string; firstMessage: string }>> = () =>
+    SessionManager.listAll(),
+): Promise<RelatedSession[]> {
+  const pattern = new RegExp(`\\b${key}\\b`, "i");
+  const sessions = (await listSessions())
+    .filter((s) => s.path !== currentSessionFile)
+    .sort((a, b) => b.modified.getTime() - a.modified.getTime())
+    .slice(0, JIRA_MAX_SESSIONS_SCANNED);
+  const related: RelatedSession[] = [];
+  for (const s of sessions) {
+    if (related.length >= JIRA_MAX_RELATED_SESSIONS) break;
+    let raw: string;
+    try {
+      raw = await readFile(s.path, "utf8");
+    } catch {
+      continue;
+    }
+    if (!pattern.test(raw)) continue;
+    const title = (s.name || s.firstMessage || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    related.push({
+      path: s.path,
+      label: `${s.modified.toISOString().slice(0, 16).replace("T", " ")} (${s.messageCount} msgs) ${title}`,
+    });
+  }
+  return related;
 }
 
 export function extractJiraKey(text: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -876,7 +1001,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("jira", {
-    description: "Tag Langfuse traces with a JIRA issue key: /jira SDEV-123, /jira clear, or /jira to show",
+    description: "Tag Langfuse traces with a JIRA issue key, load the issue into context, and offer to resume prior sessions: /jira SDEV-123, /jira clear, or /jira to show",
     handler: async (args, ctx) => {
       const arg = args.trim();
       if (!arg) {
@@ -890,8 +1015,62 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`Not a JIRA key: ${arg}`, "error");
           return;
         }
+        const lookup = await lookupJiraIssue(key);
+        if (lookup.status === "not_found") {
+          ctx.ui.notify(`JIRA issue ${key} does not exist (or is not visible to you)`, "error");
+          return;
+        }
+        const hasContext = (entries: ReadonlyArray<any>) =>
+          entries.some(
+            (e) => e.type === "custom_message" && e.customType === JIRA_CONTEXT_TYPE && e.details?.key === key,
+          );
+        if (ctx.hasUI) {
+          let related: RelatedSession[] = [];
+          try {
+            related = await findRelatedSessions(key, ctx.sessionManager.getSessionFile());
+          } catch (err) {
+            debug(`related session lookup failed: ${err}`);
+          }
+          if (related.length) {
+            const stay = "Stay in this session";
+            const choice = await ctx.ui.select(
+              `Prior sessions mention ${key}. Resume one?`,
+              [...related.map((r) => r.label), stay],
+            );
+            const picked = related.find((r) => r.label === choice);
+            if (picked) {
+              const text = lookup.status === "found" ? lookup.context : undefined;
+              await ctx.switchSession(picked.path, {
+                withSession: async (rctx) => {
+                  if (text && !hasContext(rctx.sessionManager.getEntries())) {
+                    await rctx.sendMessage({
+                      customType: JIRA_CONTEXT_TYPE,
+                      content: text,
+                      display: true,
+                      details: { key },
+                    });
+                  }
+                  rctx.ui.notify(`Resumed prior session for ${key}`, "info");
+                },
+              });
+              return;
+            }
+          }
+        }
         setJiraKey(key);
-        ctx.ui.notify(`Langfuse traces now tagged ${key}`, "info");
+        if (lookup.status === "found") {
+          if (!hasContext(ctx.sessionManager.getEntries())) {
+            pi.sendMessage({
+              customType: JIRA_CONTEXT_TYPE,
+              content: lookup.context,
+              display: true,
+              details: { key },
+            });
+          }
+          ctx.ui.notify(`Langfuse traces now tagged ${key}: ${lookup.title} (issue added to context)`, "info");
+        } else {
+          ctx.ui.notify(`Langfuse traces now tagged ${key} (could not verify via acli: ${lookup.reason})`, "warning");
+        }
       }
     },
   });
