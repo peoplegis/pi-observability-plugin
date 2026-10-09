@@ -1075,6 +1075,15 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Opt-in gate: drop prompts (before any LLM call) while no JIRA key is associated with the session.
+  // Extension commands such as /jira run before this event, so they stay usable.
+  pi.on("input", (event, ctx) => {
+    if (!/^(1|true|yes)$/i.test(process.env.LANGFUSE_REQUIRE_JIRA ?? "")) return { action: "continue" };
+    if (jiraKey || extractJiraKeyFromPrompt(event.text)) return { action: "continue" };
+    if (ctx.hasUI) ctx.ui.notify("A JIRA issue is required before prompting: run /jira KEY (e.g. /jira SDEV-123)", "error");
+    return { action: "handled" };
+  });
+
   pi.on("before_agent_start", (event, ctx) => {
     debug("before_agent_start");
     ensureRuntime();
