@@ -196,6 +196,7 @@ const ENV_PARENT_SPAN_ID = "LANGFUSE_PI_PARENT_SPAN_ID";
 const ENV_PARENT_SESSION_ID = "LANGFUSE_PI_PARENT_SESSION_ID";
 const ENV_PARENT_DEPTH = "LANGFUSE_PI_PARENT_DEPTH";
 const ENV_PARENT_EXTERNAL_TRACE = "LANGFUSE_PI_PARENT_EXTERNAL_TRACE";
+const ENV_PARENT_JIRA_KEY = "LANGFUSE_PI_PARENT_JIRA_KEY";
 
 const HEX_TRACE_ID = /^[0-9a-f]{32}$/;
 const HEX_SPAN_ID = /^[0-9a-f]{16}$/;
@@ -840,7 +841,9 @@ export default function (pi: ExtensionAPI) {
   let state: PromptState | undefined;
   let traceAttributes: TraceAttributes = {};
   let gitBranch: string | undefined;
-  let jiraKey: string | undefined = extractJiraKey(process.env.LANGFUSE_JIRA_ID);
+  // A subagent without its own key inherits the one its parent published.
+  let jiraKey: string | undefined =
+    extractJiraKey(process.env.LANGFUSE_JIRA_ID) ?? extractJiraKey(process.env[ENV_PARENT_JIRA_KEY]);
   const setJiraKey = (key: string | undefined) => {
     if (key === jiraKey) return;
     jiraKey = key;
@@ -862,6 +865,7 @@ export default function (pi: ExtensionAPI) {
     [ENV_PARENT_SESSION_ID]: process.env[ENV_PARENT_SESSION_ID],
     [ENV_PARENT_DEPTH]: process.env[ENV_PARENT_DEPTH],
     [ENV_PARENT_EXTERNAL_TRACE]: process.env[ENV_PARENT_EXTERNAL_TRACE],
+    [ENV_PARENT_JIRA_KEY]: process.env[ENV_PARENT_JIRA_KEY],
   };
 
   const ensureRuntime = (): Runtime => {
@@ -921,6 +925,8 @@ export default function (pi: ExtensionAPI) {
     process.env[ENV_PARENT_DEPTH] = String((inheritedParent?.depth ?? 0) + 1);
     if (externalTrace) process.env[ENV_PARENT_EXTERNAL_TRACE] = "1";
     else delete process.env[ENV_PARENT_EXTERNAL_TRACE];
+    if (jiraKey) process.env[ENV_PARENT_JIRA_KEY] = jiraKey;
+    else delete process.env[ENV_PARENT_JIRA_KEY];
   };
 
   // A child must not attach to a turn that has ended. The inherited values
@@ -1079,7 +1085,10 @@ export default function (pi: ExtensionAPI) {
   // Extension commands such as /jira run before this event, so they stay usable.
   pi.on("input", (event, ctx) => {
     if (!/^(1|true|yes)$/i.test(process.env.LANGFUSE_REQUIRE_JIRA ?? "")) return { action: "continue" };
-    if (jiraKey || extractJiraKeyFromPrompt(event.text)) return { action: "continue" };
+    // Never swallow a subagent's task prompt: nobody would see the notice and the task would hang.
+    if (jiraKey || inheritedParent?.source === "subagent" || extractJiraKeyFromPrompt(event.text)) {
+      return { action: "continue" };
+    }
     if (ctx.hasUI) ctx.ui.notify("A JIRA issue is required before prompting: run /jira KEY (e.g. /jira SDEV-123)", "error");
     return { action: "handled" };
   });
